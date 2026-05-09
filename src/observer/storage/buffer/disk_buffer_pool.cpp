@@ -314,7 +314,15 @@ RC DiskBufferPool::close_file()
 RC DiskBufferPool::get_this_page(PageNum page_num, Frame **frame)
 {
   RC rc  = RC::SUCCESS;
+  if (frame == nullptr) {
+    return RC::INVALID_ARGUMENT;
+  }
   *frame = nullptr;
+
+  rc = check_page_num(page_num);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
 
   Frame *used_match_frame = frame_manager_.get(id(), page_num);
   if (used_match_frame != nullptr) {
@@ -351,6 +359,10 @@ RC DiskBufferPool::get_this_page(PageNum page_num, Frame **frame)
 RC DiskBufferPool::allocate_page(Frame **frame)
 {
   RC rc = RC::SUCCESS;
+  if (frame == nullptr) {
+    return RC::INVALID_ARGUMENT;
+  }
+  *frame = nullptr;
 
   lock_.lock();
 
@@ -361,9 +373,16 @@ RC DiskBufferPool::allocate_page(Frame **frame)
       byte = i / 8;
       bit  = i % 8;
       if (((file_header_->bitmap[byte]) & (1 << bit)) == 0) {
+        Frame *allocated_frame = nullptr;
+        rc = allocate_frame(i, &allocated_frame);
+        if (rc != RC::SUCCESS) {
+          LOG_ERROR("Failed to allocate frame %s:%d, due to no free frame.", file_name_.c_str(), i);
+          lock_.unlock();
+          return rc;
+        }
+
         (file_header_->allocated_pages)++;
         file_header_->bitmap[byte] |= (1 << bit);
-        // TODO,  do we need clean the loaded page's data?
         hdr_frame_->mark_dirty();
         LSN lsn = 0;
         rc = log_handler_.allocate_page(i, lsn);
@@ -377,7 +396,14 @@ RC DiskBufferPool::allocate_page(Frame **frame)
         LOG_DEBUG("allocate a new page without extend buffer pool. page num=%d, buffer pool=%d", i, id());
 
         lock_.unlock();
-        return get_this_page(i, frame);
+
+        allocated_frame->set_buffer_pool_id(id());
+        allocated_frame->access();
+        allocated_frame->clear_page();
+        allocated_frame->set_page_num(i);
+        allocated_frame->mark_dirty();
+        *frame = allocated_frame;
+        return RC::SUCCESS;
       }
     }
   }
@@ -389,14 +415,6 @@ RC DiskBufferPool::allocate_page(Frame **frame)
     return RC::BUFFERPOOL_NOBUF;
   }
 
-  LSN lsn = 0;
-  rc = log_handler_.allocate_page(file_header_->page_count, lsn);
-  if (OB_FAIL(rc)) {
-    LOG_ERROR("Failed to log allocate page %d, rc=%s", file_header_->page_count, strrc(rc));
-    // 忽略了错误
-  }
-  hdr_frame_->set_lsn(lsn);
-
   PageNum page_num        = file_header_->page_count;
   Frame  *allocated_frame = nullptr;
   if ((rc = allocate_frame(page_num, &allocated_frame)) != RC::SUCCESS) {
@@ -404,6 +422,14 @@ RC DiskBufferPool::allocate_page(Frame **frame)
     lock_.unlock();
     return rc;
   }
+
+  LSN lsn = 0;
+  rc = log_handler_.allocate_page(file_header_->page_count, lsn);
+  if (OB_FAIL(rc)) {
+    LOG_ERROR("Failed to log allocate page %d, rc=%s", file_header_->page_count, strrc(rc));
+    // 忽略了错误
+  }
+  hdr_frame_->set_lsn(lsn);
 
   LOG_INFO("allocate new page by extending bufferpool. buffer_pool_id=%d, pageNum=%d, pin=%d",
            id(), page_num, allocated_frame->pin_count());
@@ -440,18 +466,26 @@ RC DiskBufferPool::dispose_page(PageNum page_num)
     LOG_ERROR("Failed to dispose page %d, because it is the first page. filename=%s", page_num, file_name_.c_str());
     return RC::INTERNAL;
   }
+  RC rc = check_page_num(page_num);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
   
   scoped_lock lock_guard(lock_);
   Frame           *used_frame = frame_manager_.get(id(), page_num);
   if (used_frame != nullptr) {
-    ASSERT("the page try to dispose is in use. frame:%s", used_frame->to_string().c_str());
+    if (used_frame->pin_count() != 1) {
+      LOG_WARN("failed to dispose page because it is pinned. frame:%s", used_frame->to_string().c_str());
+      used_frame->unpin();
+      return RC::LOCKED_UNLOCK;
+    }
     frame_manager_.free(id(), page_num, used_frame);
   } else {
     LOG_DEBUG("page not found in memory while disposing it. pageNum=%d", page_num);
   }
 
   LSN lsn = 0;
-  RC rc = log_handler_.deallocate_page(page_num, lsn);
+  rc = log_handler_.deallocate_page(page_num, lsn);
   if (OB_FAIL(rc)) {
     LOG_ERROR("Failed to log deallocate page %d, rc=%s", page_num, strrc(rc));
     // ignore error handle
@@ -498,7 +532,11 @@ RC DiskBufferPool::purge_page(PageNum page_num)
 
   Frame           *used_frame = frame_manager_.get(id(), page_num);
   if (used_frame != nullptr) {
-    return purge_frame(page_num, used_frame);
+    RC rc = purge_frame(page_num, used_frame);
+    if (rc != RC::SUCCESS) {
+      used_frame->unpin();
+    }
+    return rc;
   }
 
   return RC::SUCCESS;
@@ -512,7 +550,12 @@ RC DiskBufferPool::purge_all_pages()
   for (list<Frame *>::iterator it = used.begin(); it != used.end(); ++it) {
     Frame *frame = *it;
 
-    purge_frame(frame->page_num(), frame);
+    RC rc = purge_frame(frame->page_num(), frame);
+    if (rc != RC::SUCCESS) {
+      frame->unpin();
+      LOG_WARN("failed to purge page while purging all pages. frame=%s, rc=%s", frame->to_string().c_str(), strrc(rc));
+      return rc;
+    }
   }
   return RC::SUCCESS;
 }
@@ -714,14 +757,18 @@ RC DiskBufferPool::allocate_frame(PageNum page_num, Frame **buffer)
     }
 
     LOG_TRACE("frames are all allocated, so we should purge some frames to get one free frame");
-    (void)frame_manager_.purge_frames(1 /*count*/, purger);
+    int freed_count = frame_manager_.purge_frames(1 /*count*/, purger);
+    if (freed_count <= 0) {
+      LOG_WARN("failed to allocate frame because all frames are pinned. buffer_pool_id=%d, page_num=%d", id(), page_num);
+      return RC::BUFFERPOOL_NOBUF;
+    }
   }
   return RC::BUFFERPOOL_NOBUF;
 }
 
 RC DiskBufferPool::check_page_num(PageNum page_num)
 {
-  if (page_num >= file_header_->page_count) {
+  if (page_num < 0 || page_num >= file_header_->page_count) {
     LOG_ERROR("Invalid pageNum:%d, file's name:%s", page_num, file_name_.c_str());
     return RC::BUFFERPOOL_INVALID_PAGE_NUM;
   }
@@ -920,4 +967,3 @@ RC BufferPoolManager::get_buffer_pool(int32_t id, DiskBufferPool *&bp)
   bp = iter->second;
   return RC::SUCCESS;
 }
-

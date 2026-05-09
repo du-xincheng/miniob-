@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include "common/lang/filesystem.h"
 #include "common/lang/string.h"
 #include "common/log/log.h"
 #include "common/os/path.h"
@@ -173,6 +174,75 @@ RC Db::create_table(const char *table_name, span<const AttrInfoSqlNode> attribut
 
   opened_tables_[table_name] = table;
   LOG_INFO("Create table success. table name=%s, table_id:%d", table_name, table_id);
+  return RC::SUCCESS;
+}
+
+RC Db::drop_table(const char *table_name)
+{
+  if (common::is_blank(table_name)) {
+    LOG_WARN("invalid table name");
+    return RC::INVALID_ARGUMENT;
+  }
+
+  auto iter = opened_tables_.find(table_name);
+  if (iter == opened_tables_.end()) {
+    LOG_WARN("table does not exist. table name=%s", table_name);
+    return RC::SCHEMA_TABLE_NOT_EXIST;
+  }
+
+  Table *table = iter->second;
+  vector<string> index_names;
+  const TableMeta &table_meta = table->table_meta();
+  for (int i = 0; i < table_meta.index_num(); i++) {
+    const IndexMeta *index_meta = table_meta.index(i);
+    if (index_meta != nullptr) {
+      index_names.emplace_back(index_meta->name());
+    }
+  }
+
+  string meta_file = table_meta_file(path_.c_str(), table_name);
+  string data_file = table_data_file(path_.c_str(), table_name);
+  string lob_file  = table_lob_file(path_.c_str(), table_name);
+
+  opened_tables_.erase(iter);
+  delete table;
+
+  auto remove_if_exists = [](const string &file_name) -> RC {
+    error_code ec;
+    bool removed = filesystem::remove(file_name, ec);
+    if (ec) {
+      LOG_ERROR("failed to remove file. file=%s, error=%s", file_name.c_str(), ec.message().c_str());
+      return RC::IOERR_WRITE;
+    }
+    if (removed) {
+      LOG_INFO("removed file. file=%s", file_name.c_str());
+    }
+    return RC::SUCCESS;
+  };
+
+  RC rc = remove_if_exists(meta_file);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  rc = remove_if_exists(data_file);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  for (const string &index_name : index_names) {
+    rc = remove_if_exists(table_index_file(path_.c_str(), table_name, index_name.c_str()));
+    if (OB_FAIL(rc)) {
+      return rc;
+    }
+  }
+
+  rc = remove_if_exists(lob_file);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  LOG_INFO("Drop table success. table name=%s", table_name);
   return RC::SUCCESS;
 }
 

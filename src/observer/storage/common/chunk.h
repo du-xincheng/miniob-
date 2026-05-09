@@ -63,6 +63,12 @@ public:
     return column_ids_[i];
   }
 
+  int column_ids(size_t i) const
+  {
+    ASSERT(i < column_ids_.size(), "invalid column index");
+    return column_ids_[i];
+  }
+
   void add_column(unique_ptr<Column> col, int col_id);
 
   RC reference(Chunk &chunk);
