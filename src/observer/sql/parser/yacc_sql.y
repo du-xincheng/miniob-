@@ -371,7 +371,7 @@ attr_def:
       $$ = new AttrInfoSqlNode;
       $$->type = (AttrType)$2;
       $$->name = $1;
-      $$->length = $$->type == AttrType::TEXTS ? 4096 : 4;
+      $$->length = $$->type == AttrType::TEXTS ? TEXT_MAX_LEN : 4;
     }
     ;
 number:

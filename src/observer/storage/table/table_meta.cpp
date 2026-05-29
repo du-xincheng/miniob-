@@ -56,7 +56,7 @@ RC TableMeta::init(int32_t table_id, const char *name, const vector<FieldMeta> *
   }
 
   if (attributes.size() == 0) {
-    LOG_ERROR("Invalid argument. name=%s, field_num=%d", name, attributes.size());
+    LOG_ERROR("Invalid argument. name=%s, field_num=%d", name, static_cast<int>(attributes.size()));
     return RC::INVALID_ARGUMENT;
   }
 
@@ -71,7 +71,15 @@ RC TableMeta::init(int32_t table_id, const char *name, const vector<FieldMeta> *
     fields_.resize(attributes.size() + trx_fields->size());
     for (size_t i = 0; i < trx_fields->size(); i++) {
       const FieldMeta &field_meta = (*trx_fields)[i];
-      fields_[i] = FieldMeta(field_meta.name(), field_meta.type(), field_offset, field_meta.len(), false /*visible*/, field_meta.field_id());
+
+      fields_[i] = FieldMeta(
+          field_meta.name(),
+          field_meta.type(),
+          field_offset,
+          field_meta.len(),
+          false /*visible*/,
+          field_meta.field_id());
+
       field_offset += field_meta.len();
     }
 
@@ -82,24 +90,37 @@ RC TableMeta::init(int32_t table_id, const char *name, const vector<FieldMeta> *
 
   for (size_t i = 0; i < attributes.size(); i++) {
     const AttrInfoSqlNode &attr_info = attributes[i];
-    // `i` is the col_id of fields[i]
+
+    int attr_len = attr_info.length;
+
+    if (attr_info.type == AttrType::TEXTS) {
+      attr_len = TEXT_MAX_LEN;
+    }
+
     rc = fields_[i + trx_field_num].init(
-      attr_info.name.c_str(), attr_info.type, field_offset, attr_info.length, true /*visible*/, i);
+        attr_info.name.c_str(),
+        attr_info.type,
+        field_offset,
+        attr_len,
+        true /*visible*/,
+        i);
+
     if (OB_FAIL(rc)) {
       LOG_ERROR("Failed to init field meta. table name=%s, field name: %s", name, attr_info.name.c_str());
       return rc;
     }
 
-    field_offset += attr_info.length;
+    field_offset += attr_len;
   }
 
   primary_keys_ = primary_keys;
-  record_size_ = field_offset;
+  record_size_  = field_offset;
 
-  table_id_ = table_id;
-  name_     = name;
-  storage_format_ = storage_format;
-  storage_engine_ = storage_engine;
+  table_id_        = table_id;
+  name_            = name;
+  storage_format_  = storage_format;
+  storage_engine_  = storage_engine;
+
   LOG_INFO("Sussessfully initialized table meta. table id=%d, name=%s", table_id, name);
   return RC::SUCCESS;
 }

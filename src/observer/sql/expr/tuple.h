@@ -186,20 +186,30 @@ public:
 
   int cell_num() const override { return speces_.size(); }
 
-  RC cell_at(int index, Value &cell) const override
-  {
-    if (index < 0 || index >= static_cast<int>(speces_.size())) {
-      LOG_WARN("invalid argument. index=%d", index);
-      return RC::INVALID_ARGUMENT;
-    }
+ RC cell_at(int index, Value &cell) const override
+{
+  if (index < 0 || index >= static_cast<int>(speces_.size())) {
+    LOG_WARN("invalid argument. index=%d", index);
+    return RC::INVALID_ARGUMENT;
+  }
 
-    FieldExpr       *field_expr = speces_[index];
-    const FieldMeta *field_meta = field_expr->field().meta();
-    cell.reset();
-    cell.set_type(field_meta->type());
-    cell.set_data(this->record_->data() + field_meta->offset(), field_meta->len());
+  FieldExpr       *field_expr = speces_[index];
+  const FieldMeta *field_meta = field_expr->field().meta();
+
+  cell.reset();
+  cell.set_type(field_meta->type());
+
+  char *data = this->record_->data() + field_meta->offset();
+
+  if (field_meta->type() == AttrType::TEXTS) {
+    cell.set_data(data, field_meta->len());
+    cell.set_type(AttrType::TEXTS);
     return RC::SUCCESS;
   }
+
+  cell.set_data(data, field_meta->len());
+  return RC::SUCCESS;
+}
 
   RC spec_at(int index, TupleCellSpec &spec) const override
   {
